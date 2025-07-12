@@ -3,95 +3,154 @@ from odoo.exceptions import ValidationError
 from odoo.http import request, Response
 import json
 
-def json_response(success, data=None, error_code=None, error_message=None):
+def json_response(success, data=None, error_code=None, error_message=None, request_method=None):
     """
         Function to standardize response
     """
+
+    status_code = 200
+    if not success:
+        status_code = error_code or 400
+    elif request_method and request_method.upper() == 'POST':
+        status_code = 201
+
     payload = {
         'success': success,
         'data': data,
-        'error': None
-    }
-    status_code = 200
-
-    if not success:
-        payload['error'] = {
-            'code': error_message,
+        'error': None if success else {
+            'code': error_code or status_code,
             'message': error_message
         }
-        status_code = error_code
+    }
 
-    elif request.httprequest.method == 'POST' and success:
-        status_code = 201
-    return Response(json.dumps(payload), content_type='application/json', status=status_code)
+    return payload
 
-# function to validate input type
-def validate_payload(data, specs):
+
+def validate_payload(request_obj, data, specs):
     """
         Function to validate input type
-    """
-    for field, expected_type in specs.items():
-        if field in data:
-            if data[field] is not None and not isinstance(data[field], expected_type):
-                type_name = expected_type.__name__
-                if isinstance(expected_type, type):
-                    type_name = ' or '.join([t.__name__ for t in expected_type])
 
-                return False, f"field '{field}' must be a {type_name}"
+        :param request_obj: Request Object of Odoo.
+        :param data: Data JSON from request.
+        :param specs: Validation specs.
+                      Example: {'field': {'type': str, 'is_selection': True}}
+        :return: Tuple (boolean, string)
+    """
+    for field, rules in specs.items():
+        if field in data and data[field] is not None:
+            expected_type = rules.get('type')
+            if not isinstance(data[field], expected_type):
+                return False, f"Field '{field}' must be of type '{expected_type}'"
+
+            selection_model = rules.get('is_selection')
+            if selection_model:
+                is_valid, error_message = validate_selection_field(request_obj, field, data[field])
+                if not is_valid:
+                    return False, error_message
+
+    return True, None
+
+def validate_selection_field(model_obj, field_name, value_to_check):
+    """
+        Function to validate selection field
+
+        :param model_obj: Request Object of Odoo
+        :param field_name: Field name to validate
+        :param value_to_check: Value to validate
+    """
+    if not value_to_check:
+        return True, None
+
+    try:
+        field = model_obj.fields_get([field_name])['type']
+        valid_values = [value for value, label in field['selection']]
+    except KeyError:
+        return False, f"Invalid field '{field_name}' in model '{type(model_obj).__name__}'"
+
+    if value_to_check not in valid_values:
+        return False, f"Invalid value '{value_to_check}' for field '{field_name}' in model '{type(model_obj).__name__}'"
+
     return True, None
 
 
 class MaterialBackendTestController(http.Controller):
 
-    required_fields = ['name', 'code', 'type', 'buy_price', 'supplier_id']
+    type_specs = {
+        'name': {'type':str},
+        'code': {'type':(str, int)},
+        'type': {'type':str, 'is_selection':True},
+        'buy_price': {'type':(int, float)},
+        'supplier_id': {'type':int},
+    }
 
-    @http.route('/api/material/', type='json', auth='public', methods=['GET'], csrf=False)
+    @http.route('/api/material/', type='http', auth='public', methods=['GET'], csrf=False)
     def list_materials(self, **kwargs):
-        material_type = kwargs.get('type')
-        domain = []
-        if material_type:
-            domain = [('type', '=', material_type)]
         material_obj = request.env['material.material'].sudo()
+
+        domain = []
+        material_type = kwargs.get('type')
+        if material_type:
+            material_type = str(material_type).lower()
+            is_valid, error_message = validate_selection_field(material_obj, 'type', material_type)
+            if not is_valid:
+                error_message = f"Invalid value '{material_type}' for field 'type' in model '{type(material_obj).__name__}'"
+                payload = json_response(False, error_code=400, error_message=error_message)
+                return Response(
+                    json.dumps(payload),
+                    content_type='application/json',
+                    status=400
+                )
+            domain = [('type', '=', material_type)]
+
         materials = material_obj.search_read(domain, ['id', 'name', 'code', 'type', 'buy_price', 'supplier_id'])
-        return json_response(True, data=materials)
+        payload = json_response(True, data=materials)
+        return Response(
+            json.dumps(payload),
+            content_type='application/json',
+            status=200
+        )
 
     @http.route('/api/material/create', type='json', auth='public', methods=['POST'], csrf=False)
     def create_material(self, **kwargs):
         data = request.jsonrequest
+        if not data:
+            return json_response(False, error_code=400, error_message='No data provided')
 
-        type_specs = {
-            'name': str,
-            'code': str,
-            'type': str,
-            'buy_price': (int, float),
-            'supplier_id': int,
-        }
-        is_valid, error_message = validate_payload(data, type_specs)
+        material_obj = request.env['material.material'].sudo()
+
+        is_valid, error_message = validate_payload(material_obj, data, self.type_specs)
         if not is_valid:
             return json_response(False, error_code=400, error_message=error_message)
 
-        missing_fields = [data_field for data_field in self.required_fields if data_field not in data]
+        missing_fields = [data_field for data_field in self.type_specs if data_field not in data]
         if missing_fields:
-            return json_response(False, error_code=400, error_message=f'missing fields in request: {", ".join(missing_fields)}')
+            return json_response(False,
+                                 error_code=400,
+                                 error_message=f'missing fields in request: {", ".join(missing_fields)}')
+
+        if data.get('buy_price') and data.get('buy_price') < 100:
+            return json_response(False, error_code=400, error_message='Buy price cannot be less than 100')
 
         supplier_id = data.get('supplier_id')
         supplier_obj = request.env['supplier.supplier'].sudo()
-        supplier = supplier_obj.browse(supplier_id)
+        supplier = supplier_obj.search([('id','=',supplier_id)])
 
         if not supplier:
             return json_response(False, error_code=404, error_message='Supplier not found')
 
         try:
-            created_material = request.env['material.material'].sudo().create(data)
+            created_material = material_obj.create(data)
             material_data = created_material.read(['id', 'name', 'code', 'type', 'buy_price', 'supplier_id'])
-            return json_response(True, data=material_data)
+            return json_response(True, data=material_data, request_method=request.httprequest.method)
+        except ValidationError as e:
+            return json_response(False, error_code=400, error_message=str(e.args[0]))
         except Exception as e:
             return json_response(False, error_code=500, error_message=f"An unexpected server error occurred: {e}")
 
     @http.route('/api/material/update/<int:material_id>', type='json', auth='public', methods=['PUT'], csrf=False)
     def update_material(self, material_id, **kwargs):
         material_obj = request.env['material.material'].sudo()
-        material = material_obj.browse(material_id)
+        material = material_obj.search([('id', '=', material_id)])
         if not material:
             return json_response(False, error_code=404, error_message='Material not found')
 
@@ -99,21 +158,16 @@ class MaterialBackendTestController(http.Controller):
         if not data:
             return json_response(False, error_code=400, error_message='No data provided')
 
-        type_specs = {
-            'name': str,
-            'code': str,
-            'type': str,
-            'buy_price': (int, float),
-            'supplier_id': int,
-        }
-
-        is_valid, error_message = validate_payload(data, type_specs)
+        is_valid, error_message = validate_payload(material_obj, data, self.type_specs)
         if not is_valid:
             return json_response(False, error_code=400, error_message=error_message)
 
+        if data.get('buy_price') and data.get('buy_price') < 100:
+            return json_response(False, error_code=400, error_message='Buy price cannot be less than 100')
+
         if data.get('supplier_id'):
             supplier_obj = request.env['supplier.supplier'].sudo()
-            supplier = supplier_obj.browse(data.get('supplier_id'))
+            supplier = supplier_obj.search([('id','=',data.get('supplier_id'))])
             if not supplier:
                 return json_response(False, error_code=404, error_message='Supplier not found')
 
@@ -126,15 +180,25 @@ class MaterialBackendTestController(http.Controller):
         except Exception as e:
             return json_response(False, error_code=500, error_message=f"An unexpected server error occurred: {e}")
 
-    @http.route('/api/material/delete/<int:material_id>', type='json', auth='public', methods=['DELETE'], csrf=False)
+    @http.route('/api/material/delete/<int:material_id>', type='http', auth='public', methods=['DELETE'], csrf=False)
     def delete_material(self, material_id, **kwargs):
         material_obj = request.env['material.material'].sudo()
-        material = material_obj.browse(material_id)
+        material = material_obj.search([('id','=',material_id)])
         if not material:
             return json_response(False, error_code=404, error_message='Material not found')
 
         try:
             material.unlink()
-            return json_response(True, data={'message': 'Material deleted successfully'})
+            payload = json_response(True, data={'message': 'Material deleted successfully'})
+            return Response(
+                json.dumps(payload),
+                content_type='application/json',
+                status=200
+            )
         except Exception as e:
-            return json_response(False, error_code=500, error_message=f"An unexpected server error occurred: {e}")
+            payload = json_response(False, error_code=500, error_message=f"An unexpected server error occurred: {e}")
+            return Response(
+                json.dumps(payload),
+                content_type='application/json',
+                status=500
+            )
