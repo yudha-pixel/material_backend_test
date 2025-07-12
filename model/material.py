@@ -1,4 +1,4 @@
-from odoo import models, fields, api
+from odoo import models, fields, api, _
 from odoo.exceptions import ValidationError
 
 class Material(models.Model):
@@ -15,9 +15,3 @@ class Material(models.Model):
     _sql_constraints = [
         ('code_unique', 'UNIQUE(code)', 'Code must be unique')
     ]
-
-    @api.constrains('buy_price')
-    def _check_buy_price(self):
-        for record in self:
-            if record.buy_price < 100:
-                raise ValidationError('Buy price cannot be less than 100')
