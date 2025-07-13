@@ -17,6 +17,7 @@ def json_response(success, data=None, error_code=None, error_message=None, reque
     payload = {
         'success': success,
         'data': data,
+        'status_code': status_code,
         'error': None if success else {
             'code': error_code or status_code,
             'message': error_message
@@ -82,25 +83,15 @@ class MaterialBackendTestController(http.Controller):
         'buy_price': {'type':(int, float)},
         'supplier_id': {'type':int},
     }
+    allowed_filter = ['type']
 
-    @http.route('/api/material/', type='http', auth='public', methods=['GET'], csrf=False)
+    @http.route('/api/material', type='http', auth='public', methods=['GET'], csrf=False)
     def list_materials(self, **kwargs):
         material_obj = request.env['material.material'].sudo()
 
         domain = []
-        material_type = kwargs.get('type')
-        if material_type:
-            material_type = str(material_type).lower()
-            is_valid, error_message = validate_selection_field(material_obj, 'type', material_type)
-            if not is_valid:
-                error_message = f"Invalid value '{material_type}' for field 'type' in model '{type(material_obj).__name__}'"
-                payload = json_response(False, error_code=400, error_message=error_message)
-                return Response(
-                    json.dumps(payload),
-                    content_type='application/json',
-                    status=400
-                )
-            domain = [('type', '=', material_type)]
+        for key in set(kwargs.keys()) & set(self.allowed_filter):
+            domain.append((key, '=', kwargs[key]))
 
         materials = material_obj.search_read(domain, ['id', 'name', 'code', 'type', 'buy_price', 'supplier_id'])
         payload = json_response(True, data=materials)
@@ -128,7 +119,10 @@ class MaterialBackendTestController(http.Controller):
                                  error_code=400,
                                  error_message=f'missing fields in request: {", ".join(missing_fields)}')
 
-        if data.get('buy_price') and data.get('buy_price') < 100:
+        if not data.get('buy_price'):
+            return json_response(False, error_code=400, error_message='Buy price is required and cannot be null')
+
+        if data.get('buy_price') < 100:
             return json_response(False, error_code=400, error_message='Buy price cannot be less than 100')
 
         supplier_id = data.get('supplier_id')
@@ -141,7 +135,8 @@ class MaterialBackendTestController(http.Controller):
         try:
             created_material = material_obj.create(data)
             material_data = created_material.read(['id', 'name', 'code', 'type', 'buy_price', 'supplier_id'])
-            return json_response(True, data=material_data, request_method=request.httprequest.method)
+            new_json_response = json_response(True, data=material_data, request_method=request.httprequest.method)
+            return new_json_response
         except ValidationError as e:
             return json_response(False, error_code=400, error_message=str(e.args[0]))
         except Exception as e:
@@ -185,7 +180,12 @@ class MaterialBackendTestController(http.Controller):
         material_obj = request.env['material.material'].sudo()
         material = material_obj.search([('id','=',material_id)])
         if not material:
-            return json_response(False, error_code=404, error_message='Material not found')
+            payload = json_response(False, error_code=404, error_message='Material not found')
+            return Response(
+                json.dumps(payload),
+                content_type='application/json',
+                status=404
+            )
 
         try:
             material.unlink()
